@@ -1,0 +1,24 @@
+{
+  "name": "@matthew-dresden/opencode-zai-multi-account",
+  "version": "0.0.0",
+  "description": "opencode v2 plugin: Z.AI coding-plan key-pool auth, rotation, and quota hold-and-resume",
+  "type": "module",
+  "main": "index.js",
+  "license": "Apache-2.0",
+  "private": false,
+  "files": [
+    "index.js",
+    "src",
+    "NOTICE"
+  ],
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com/"
+  },
+  "scripts": {
+    "test": "node --test tests/zai-quota.test.mjs tests/plugin.test.mjs tests/env-overrides.test.mjs tests/v1-server.test.mjs",
+    "check:tarball": "node scripts/check-tarball.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
