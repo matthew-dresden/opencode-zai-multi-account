@@ -47,16 +47,16 @@ after(() => {
   for (const cleanup of cleanups) cleanup()
 })
 
-function reqEvent(body) {
+function reqEvent(body, url = URL) {
   return {
     kind: "primary",
-    request: new Request(URL, { method: "POST", body: JSON.stringify(body) }),
+    request: new Request(url, { method: "POST", body: JSON.stringify(body) }),
   }
 }
 
-function resEvent(request, status, headers = {}) {
+function resEvent(request, status, headers = {}, sessionID = "s1") {
   return {
-    sessionID: "s1",
+    sessionID,
     agent: "build",
     model: { providerID: "zai-max", id: "glm-5.3-flash" },
     kind: "primary",
@@ -198,6 +198,13 @@ test("attempt-budget amendment: forced retries stop at the bound and surface the
   const mod = await load("budget")
   const hooks = await boot(mod)
 
+  // Seed a stashed subscription-endpoint 429 for the session: since the
+  // /coding/ gate was restored (amendment 11), the hold-and-resume machinery
+  // only runs for a stashed 429 hold.
+  const seed = reqEvent({ model: "glm-5.3-flash", messages: [] })
+  await hooks.get("http.request").cb(seed)
+  await hooks.get("http.response").cb(resEvent(seed.request, 429, {}, "budget-session"))
+
   // Attempts 2..24 (bound default 24) force retries with hold-and-resume;
   // attempt 25 exceeds the bound and must surface the error.
   const decisions = []
@@ -239,4 +246,125 @@ test("empty pool: hooks leave the request untouched so config/env auth applies",
   assert.deepEqual(retry.decision, { retry: false })
 
   writePool(KEYS.map((apiKey) => ({ label: `k-${apiKey.slice(0, 5)}`, apiKey })))
+})
+
+// --- Review-round additions (findings 1, 2, 3, 5, 6) ---
+
+test("all keys hard-disabled: request fails loudly instead of going out unauthenticated", async () => {
+  writePool([{ label: "only", apiKey: "solo-key-0001" }])
+  const mod = await load("hard-disabled")
+  const hooks = await boot(mod)
+
+  const event = reqEvent({ model: "glm-5.3-flash", messages: [] })
+  await hooks.get("http.request").cb(event)
+  await hooks.get("http.response").cb(resEvent(event.request, 403))
+  const retry = retryEvent(403, 2)
+  await hooks.get("retry").cb(retry)
+  assert.deepEqual(retry.decision, { retry: false })
+
+  // Re-issue with every key hard-disabled: loud plugin-attributed failure,
+  // never a silent unauthenticated passthrough.
+  const reissue = reqEvent({ model: "glm-5.3-flash", messages: [] })
+  await assert.rejects(
+    hooks.get("http.request").cb(reissue),
+    (err) => {
+      assert.match(err.message, /zai-multi-account/)
+      assert.match(err.message, /hard-disabled/)
+      assert.match(err.message, /unauthenticated/)
+      return true
+    },
+  )
+  assert.equal(reissue.request.headers.get("authorization"), null, "no request may go out without credentials")
+})
+
+test("retry on 401 while keys are merely cooling must not answer retry:false (amendment 4)", async () => {
+  writePool([{ label: "only", apiKey: "cool401-key-01" }])
+  const mod = await load("cooling-401")
+  const hooks = await boot(mod)
+
+  const event = reqEvent({ model: "glm-5.3-flash", messages: [] })
+  await hooks.get("http.request").cb(event)
+  // 429 puts the only key on cooldown - merely rate-limited, not disabled.
+  await hooks.get("http.response").cb(resEvent(event.request, 429))
+
+  const retry = retryEvent(401, 2)
+  await hooks.get("retry").cb(retry)
+  assert.deepEqual(retry.decision, { retry: true, delay: 0 }, "a merely-cooling pool must never surface retry:false")
+})
+
+test("broken key entry (invalid header material) fails loudly on the auth path", async () => {
+  writePool([{ label: "bad", apiKey: "bad\nkey-0001" }])
+  const mod = await load("broken-key")
+  const hooks = await boot(mod)
+
+  const event = reqEvent({ model: "glm-5.3-flash", messages: [] })
+  await assert.rejects(
+    hooks.get("http.request").cb(event),
+    (err) => {
+      assert.match(err.message, /zai-multi-account/)
+      assert.match(err.message, /auth failed/)
+      return true
+    },
+  )
+  assert.equal(event.request.headers.get("authorization"), null, "no partial auth may leak onto the request")
+})
+
+test("retry hook non-essential failure: malformed error event is logged and yields no decision", async () => {
+  writePool(KEYS.map((apiKey) => ({ label: `k-${apiKey.slice(0, 5)}`, apiKey })))
+  const mod = await load("retry-guard")
+  const hooks = await boot(mod)
+
+  const event = retryEvent(429, 2)
+  delete event.error // malformed: classification cannot even read the status
+  await assert.doesNotReject(hooks.get("retry").cb(event))
+  assert.equal(event.decision, undefined, "guarded non-essential failure must leave the host default in place")
+})
+
+test("pendingHoldMs is session-keyed: two concurrent sessions hold independently", async () => {
+  writePool(KEYS.map((apiKey) => ({ label: `k-${apiKey.slice(0, 5)}`, apiKey })))
+  const mod = await load("session-holds")
+  const hooks = await boot(mod)
+
+  // Session A: 429 with Retry-After 30ms. Session B: 429 with no header, so
+  // its stash falls back to the 5ms poll interval. With the old module-global
+  // pendingHoldMs, B's stash overwrote A's and A under-held (5ms); with
+  // session-keyed holds, A must hold its own ~30ms.
+  const a = reqEvent({ model: "glm-5.3-flash", messages: [] })
+  await hooks.get("http.request").cb(a)
+  await hooks.get("http.response").cb(resEvent(a.request, 429, { "retry-after": "0.03" }, "sess-a"))
+
+  const b = reqEvent({ model: "glm-5.3-flash", messages: [] })
+  await hooks.get("http.request").cb(b)
+  await hooks.get("http.response").cb(resEvent(b.request, 429, {}, "sess-b"))
+
+  const ta = Date.now()
+  const retryA = retryEvent(429, 2, "sess-a")
+  await hooks.get("retry").cb(retryA)
+  const elapsedA = Date.now() - ta
+  assert.deepEqual(retryA.decision, { retry: true, delay: 0 })
+  assert.ok(elapsedA >= 25, `session A must hold its own ~30ms Retry-After, saw ${elapsedA}ms`)
+
+  const retryB = retryEvent(429, 2, "sess-b")
+  await hooks.get("retry").cb(retryB)
+  assert.deepEqual(retryB.decision, { retry: true, delay: 0 })
+  // The discriminator is session A's lower bound: under the old module-global
+  // stash, B's 5ms poll stash overwrote A's 30ms and A's hold dropped to ~5ms,
+  // failing the >= 25ms assertion above. B's own hold is not asserted against
+  // a tight upper bound (timer scheduling jitter must not flake the suite).
+})
+
+test("non-coding 429 is not held: the V1 /coding/ endpoint gate applies to the hold", async () => {
+  writePool(KEYS.map((apiKey) => ({ label: `k-${apiKey.slice(0, 5)}`, apiKey })))
+  const mod = await load("coding-gate")
+  const hooks = await boot(mod)
+
+  const NON_CODING = "https://api.z.ai/api/paas/v4/chat/completions"
+  const event = reqEvent({ model: "glm-5.3-flash", messages: [] }, NON_CODING)
+  await hooks.get("http.request").cb(event)
+  assert.equal(event.request.headers.get("authorization"), `Bearer ${KEYS[0]}`, "auth still applies to any URL")
+
+  await hooks.get("http.response").cb(resEvent(event.request, 429))
+  const retry = retryEvent(429, 2)
+  await hooks.get("retry").cb(retry)
+  assert.equal(retry.decision, undefined, "non-subscription 429 must not be force-retried by the hold machinery")
 })

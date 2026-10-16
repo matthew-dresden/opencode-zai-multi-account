@@ -16,11 +16,18 @@
 //   - key pool rotation on auth errors (401/403) and rate limits (429)
 //   - quota hold-and-resume: when the subscription quota is exhausted (429),
 //     the request is held and retried until the quota resets, so a quota
-//     window surfaces as latency instead of a hard error
+//     window surfaces as latency instead of a hard error (subscription
+//     /coding/ endpoints only, in both halves)
+//   - never unauthenticated: with a non-empty pool, a request whose keys are
+//     all merely cooling down (429) is held until the earliest cooldown
+//     expiry and issued authenticated; it fails loudly only when the
+//     hold/attempt budget is exhausted or every key is hard-disabled
 //   - attempt budget: holds and forced retries are bounded (total hold per
 //     request <= ZAI_QUOTA_WAIT_MAX_MS; total attempts <=
 //     ZAI_MAX_RETRY_ATTEMPTS, default 24); beyond either bound the provider
 //     error surfaces instead of retrying forever
+//   - guarded hooks: non-essential hook failures log and proceed; auth-path
+//     failures throw plugin-attributed errors (never a silent degrade)
 //
 // The quota-wait, request-body, and model-profile helpers live in src/ as
 // verbatim ports of the config repo's lib/ modules.
@@ -59,6 +66,14 @@ const QUOTA_WAIT_POLL_MS = Number(process.env.ZAI_QUOTA_WAIT_POLL_MS || 300000)
 const MAX_RETRY_ATTEMPTS = Number(process.env.ZAI_MAX_RETRY_ATTEMPTS || 24)
 const LOG_PATH = process.env.ZAI_MULTI_ACCOUNT_LOG || null
 
+// Rotation bookkeeping is index-keyed (positions in state.accounts), the same
+// shape V1 used. Decision (recorded per amendment 12): this index-keying is
+// inherited across pool hot-reloads deliberately. A reload that reorders the
+// pool file can land a stale disable/cooldown on the wrong slot; the cost is
+// bounded (one bad response on the mislabeled slot) and self-healing, since
+// the key actually failing gets re-classified at its current index on the
+// next 401/403/429. Key-string keying was rejected: it would diverge the
+// shared state shape from the preserved-verbatim V1 server() half.
 const state = { accounts: [], loadedAt: 0, active: 0, limitedUntil: new Map(), disabled: new Set(), log: null }
 
 function loadPool(force = false) {
@@ -118,6 +133,27 @@ function logLine(obj) {
     if (LOG_PATH) appendFileSync(LOG_PATH, line)
     else process.stderr.write(line)
   } catch {}
+}
+
+// Plugin-attributed error: auth-path failures surface with this prefix so a
+// live-session failure is unmistakably the plugin's (amendment 9).
+function pluginError(message) {
+  return new Error(`zai-multi-account: ${message}`)
+}
+
+function errText(err) {
+  return err?.message || String(err)
+}
+
+// Earliest future cooldown expiry among keys that are merely rate-limited
+// (429) - hard-disabled (401/403) keys are excluded because waiting for them
+// is futile. Infinity when no key is cooling.
+function earliestCoolingExpiry(now = Date.now()) {
+  let earliest = Infinity
+  for (const [i, until] of state.limitedUntil) {
+    if (!state.disabled.has(i) && until > now && until < earliest) earliest = until
+  }
+  return earliest
 }
 
 // ---------------------------------------------------------------------------
@@ -263,7 +299,66 @@ export const ZaiMultiAccount = async ({ client }) => {
 // v2 shape: session HTTP-boundary hooks per the ratified spike design
 // (SPIKE-2.2-zai-auth.md, verdict (e): PORT VIABLE via http.request /
 // http.response / retry) plus the attempt-budget amendment.
+//
+// Amendment 9 guarding: every hook callback body is wrapped. Non-essential
+// failures (logging, body-rewrite enhancement, classification bookkeeping)
+// are logged and the request proceeds; auth-path failures (key resolution,
+// header injection) are logged loudly and rethrown as plugin-attributed
+// errors - never a silent skip, never an unauthenticated request.
+//
+// Amendment 4: a non-empty pool never lets a request through without auth.
+// When every key is merely cooling down (429), the request is held (surfaces
+// as latency, as in V1) until the earliest cooldown expiry; it fails loudly
+// only when the hold/attempt budget is exhausted or every key is
+// hard-disabled.
 // ---------------------------------------------------------------------------
+
+// Resolves the active pool index for an outgoing request. Returns -1 only for
+// an empty pool (the documented fail-soft passthrough). For a non-empty pool
+// it holds while keys are merely cooling down, bounded by the amendment
+// budget (hold <= ZAI_QUOTA_WAIT_MAX_MS, hold attempts <=
+// ZAI_MAX_RETRY_ATTEMPTS), and throws plugin-attributed errors on exhaustion.
+async function resolveUsableIndex() {
+  loadPool()
+  if (state.accounts.length === 0) return -1
+  let idx = activeIndex()
+  let heldMs = 0
+  let holdAttempts = 0
+  while (idx === -1) {
+    holdAttempts++
+    const now = Date.now()
+    const earliest = earliestCoolingExpiry(now)
+    if (!Number.isFinite(earliest)) {
+      // Every key hard-disabled: waiting is futile, and issuing
+      // unauthenticated is forbidden - fail loudly.
+      throw pluginError(
+        `all ${state.accounts.length} pool keys are hard-disabled (401/403); ` +
+        "refusing to issue an unauthenticated request",
+      )
+    }
+    const budgetLeft = QUOTA_WAIT_MAX_MS - heldMs
+    const wait = Math.min(earliest - now, budgetLeft)
+    if (holdAttempts > MAX_RETRY_ATTEMPTS || wait <= 0) {
+      throw pluginError(
+        `all keys cooling down: next key usable at ${new Date(earliest).toISOString()}; ` +
+        `held ${heldMs}ms of the ${QUOTA_WAIT_MAX_MS}ms cap across ${holdAttempts} hold attempts ` +
+        `(max ${MAX_RETRY_ATTEMPTS}); refusing to issue an unauthenticated request`,
+      )
+    }
+    logLine({
+      event: "all_keys_cooling_hold",
+      waitMs: wait,
+      heldMs,
+      holdAttempts,
+      maxAttempts: MAX_RETRY_ATTEMPTS,
+      nextUsableAt: new Date(earliest).toISOString(),
+    })
+    await sleep(wait) // hold-and-resume: the cooldown window surfaces as latency
+    heldMs += wait
+    idx = activeIndex()
+  }
+  return idx
+}
 
 export default {
   id: "zai-multi-account",
@@ -274,122 +369,222 @@ export default {
 
     // Correlates an http.request event to its http.response event by request
     // object (the response event carries the same request reference). Holds
-    // the key index and the request start time.
+    // the key index and the request start time. If the host does not preserve
+    // request identity across the body-rewrite replacement, the miss is
+    // logged loudly (correlation_miss) and observable at the 2.3b live gate.
     const pending = new WeakMap()
-    // Cumulative quota-hold milliseconds, keyed by sessionID. The retry hook
-    // has no request reference, so per-session is the closest available
-    // correlation; the accumulator resets on every non-429 response in the
-    // session, so it can only ever under-hold (cap engages early), never
-    // over-hold past the amendment cap.
+    // Per-session quota-hold records: { heldMs, holdMs }. The retry hook has
+    // no request reference, so per-session is the closest available
+    // correlation. holdMs is the per-429 stash (Retry-After-derived wait) and
+    // is session-keyed per amendment 5 - a session's stash can no longer be
+    // overwritten by another session's 429 (the earlier module-global
+    // pendingHoldMs bled across sessions and over-held). heldMs accumulates
+    // the hold actually spent, so accounting is bounded in both directions:
+    // each wait is capped by the stashed holdMs and the total by
+    // ZAI_QUOTA_WAIT_MAX_MS. Known limitation: parallel `title` and `primary`
+    // requests share one sessionID and therefore one record (the retry event
+    // carries no request/kind reference - an event-surface limit); the max
+    // in-hook sleep is measured at the 2.3b live gate.
     const holds = new Map()
 
     await ctx.session.hook("http.request", async (event) => {
-      const idx = activeIndex()
-      if (idx === -1) return // empty pool: let config/env auth apply (v1 fail-soft, unchanged)
-      const key = state.accounts[idx].apiKey
-      event.request.headers.set("authorization", `Bearer ${key}`)
-
-      // Registry enforcement at the wire boundary, same position as the v1
-      // fetch wrapper. withProfileBody returns the same request when nothing
-      // needed rewriting; a rewritten request arrives as a new Request.
-      const enforced = await withProfileBody(event.request, undefined, (message) =>
-        logLine({ event: "body", message }),
-      )
-      if (enforced.input instanceof Request && enforced.input !== event.request) {
-        event.request = enforced.input
+      // --- auth path: failures here are loud, never silent, and the request
+      // --- is never issued without credentials.
+      let idx
+      try {
+        idx = await resolveUsableIndex()
+      } catch (err) {
+        logLine({ event: "hook_auth_failure", hook: "http.request", error: errText(err) })
+        throw err
       }
-      pending.set(event.request, { idx, t0: Date.now() })
-      logLine({ event: "http.request", kind: event.kind, url: event.request.url, keyPrefix: maskKey(key) })
+      if (idx === -1) return // empty pool: let config/env auth apply (v1 fail-soft, unchanged; request untouched)
+      let key
+      try {
+        key = state.accounts[idx].apiKey
+        // Malformed key material from the pool file throws here (invalid
+        // header value) - it must surface loudly, not degrade silently.
+        event.request.headers.set("authorization", `Bearer ${key}`)
+      } catch (err) {
+        const wrapped = pluginError(`http.request auth failed: ${errText(err)}`)
+        logLine({ event: "hook_auth_failure", hook: "http.request", error: errText(wrapped) })
+        throw wrapped
+      }
+
+      // --- non-essential: body-rewrite enhancement + correlation bookkeeping
+      // --- + logging. A failure here logs and proceeds with the
+      // --- (already authenticated) request.
+      try {
+        // Registry enforcement at the wire boundary, same position as the v1
+        // fetch wrapper. withProfileBody returns the same request when nothing
+        // needed rewriting; a rewritten request arrives as a new Request.
+        const enforced = await withProfileBody(event.request, undefined, (message) =>
+          logLine({ event: "body", message }),
+        )
+        if (enforced.input instanceof Request && enforced.input !== event.request) {
+          event.request = enforced.input
+        }
+        pending.set(event.request, { idx, t0: Date.now() })
+        logLine({ event: "http.request", kind: event.kind, url: event.request.url, keyPrefix: maskKey(key) })
+      } catch (err) {
+        logLine({ event: "hook_non_essential_failure", hook: "http.request", error: errText(err) })
+      }
     }, { providerID: PROVIDER_ID })
 
     await ctx.session.hook("http.response", (event) => {
-      const { status } = event.response
-      const meta = pending.get(event.request) ?? {}
-      const durationMs = meta.t0 !== undefined ? Date.now() - meta.t0 : null
-      logLine({
-        event: "http.response",
-        kind: event.kind,
-        status,
-        durationMs,
-        keyPrefix: meta.idx !== undefined ? maskKey(state.accounts[meta.idx]?.apiKey) : undefined,
-      })
-
-      if (status === 429) {
-        // Rate-limited key: cooldown, then stash the Retry-After-derived hold
-        // for the retry hook. Rotation to the next usable key happens on the
-        // next http.request via activeIndex().
-        if (meta.idx !== undefined) state.limitedUntil.set(meta.idx, Date.now() + COOLDOWN_MS)
-        const holdMs = quotaWaitMs(event.response, QUOTA_WAIT_POLL_MS)
-        state.pendingHoldMs = holdMs
+      // --- classification bookkeeping: entirely non-essential. Any failure
+      // --- (e.g. a hostile response surface) is logged and the response
+      // --- proceeds to the provider/host untouched.
+      try {
+        const { status } = event.response
+        const meta = pending.get(event.request) ?? {}
+        if (meta.idx === undefined && state.accounts.length > 0) {
+          // Amendment 7: a correlation miss is never silent. If the host does
+          // not preserve request identity across the body-rewrite
+          // replacement, this line makes it observable (2.3b live gate);
+          // cooldowns/401-403 disables would be lost in that case, while
+          // holds still work via the session-keyed stash and rotation still
+          // advances (bounded by the attempt cap).
+          logLine({
+            event: "correlation_miss",
+            kind: event.kind,
+            status,
+            sessionID: event.sessionID,
+            url: requestUrl(event.request),
+          })
+        }
+        const durationMs = meta.t0 !== undefined ? Date.now() - meta.t0 : null
         logLine({
-          event: "quota_429",
-          keyIndex: meta.idx,
-          holdMs,
-          retryAfter: event.response.headers.get("retry-after"),
-          cooldownMs: COOLDOWN_MS,
+          event: "http.response",
+          kind: event.kind,
+          status,
+          durationMs,
+          keyPrefix: meta.idx !== undefined ? maskKey(state.accounts[meta.idx]?.apiKey) : undefined,
         })
-        return
-      }
 
-      // Any non-429 terminal response ends hold accounting for this session.
-      holds.delete(event.sessionID)
+        if (status === 429) {
+          // Rate-limited key: cooldown, then stash the Retry-After-derived
+          // hold for the retry hook. Rotation to the next usable key happens
+          // on the next http.request via activeIndex().
+          if (meta.idx !== undefined) state.limitedUntil.set(meta.idx, Date.now() + COOLDOWN_MS)
+          const holdMs = quotaWaitMs(event.response, QUOTA_WAIT_POLL_MS)
+          // Amendment 11: the V1 /coding/ endpoint gate is restored - only
+          // subscription-endpoint 429s drive the hold-and-resume machinery,
+          // keeping both halves of this file behavior-aligned under any
+          // provider baseURL configuration. The stash is session-keyed
+          // (amendment 5), not module-global.
+          let stashed = false
+          if (isSubscriptionEndpoint(requestUrl(event.request))) {
+            const hold = holds.get(event.sessionID) ?? { heldMs: 0 }
+            hold.holdMs = holdMs
+            holds.set(event.sessionID, hold)
+            stashed = true
+          }
+          logLine({
+            event: "quota_429",
+            keyIndex: meta.idx,
+            holdMs,
+            stashed,
+            retryAfter: event.response.headers.get("retry-after"),
+            cooldownMs: COOLDOWN_MS,
+          })
+          return
+        }
 
-      if ((status === 401 || status === 403) && meta.idx !== undefined) {
-        // Rejected key: disable it; the retry hook advances the active key.
-        state.disabled.add(meta.idx)
-        logLine({ event: "key_rejected", status, keyIndex: meta.idx, keyPrefix: maskKey(state.accounts[meta.idx]?.apiKey) })
+        // Any non-429 terminal response ends hold accounting for this session.
+        holds.delete(event.sessionID)
+
+        if ((status === 401 || status === 403) && meta.idx !== undefined) {
+          // Rejected key: disable it; the retry hook advances the active key.
+          state.disabled.add(meta.idx)
+          logLine({ event: "key_rejected", status, keyIndex: meta.idx, keyPrefix: maskKey(state.accounts[meta.idx]?.apiKey) })
+        }
+      } catch (err) {
+        logLine({ event: "hook_non_essential_failure", hook: "http.response", error: errText(err) })
       }
     }, { providerID: PROVIDER_ID })
 
     await ctx.session.hook("retry", async (event) => {
-      const { status } = event.error
+      // --- retry decisions are classification/rotation bookkeeping: a
+      // --- failure here logs and proceeds without a decision (the host's
+      // --- default retry behavior applies). The authoritative auth path is
+      // --- http.request, which fails loudly on key trouble.
+      try {
+        const { status } = event.error
 
-      // Attempt-budget amendment: no infinite retry. Beyond the configured
-      // total attempt bound, surface the error.
-      if (event.attempt > MAX_RETRY_ATTEMPTS) {
-        event.decision = { retry: false }
-        logLine({ event: "retry_budget_exhausted", attempt: event.attempt, maxAttempts: MAX_RETRY_ATTEMPTS, status })
-        return
-      }
-
-      if (status === 401 || status === 403) {
-        const next = nextUsable(state.active)
-        if (next === -1) {
+        // Attempt-budget amendment: no infinite retry. Beyond the configured
+        // total attempt bound, surface the error.
+        if (event.attempt > MAX_RETRY_ATTEMPTS) {
           event.decision = { retry: false }
-          logLine({ event: "all_keys_rejected", status })
+          logLine({ event: "retry_budget_exhausted", attempt: event.attempt, maxAttempts: MAX_RETRY_ATTEMPTS, status })
           return
         }
-        state.active = next
-        event.decision = { retry: true, delay: 0 }
-        logLine({
-          event: "rotation",
-          from: event.attempt,
-          to: maskKey(state.accounts[next].apiKey),
-          reason: `status ${status}`,
-        })
-        return
-      }
 
-      if (status === 429 && QUOTA_WAIT_ENABLED) {
-        // Quota hold-and-resume: hold inside this hook invocation (the
-        // faithful shape per the spike - the host's built-in attempt budget
-        // is a hard limit, so holding in one logical retry preserves the v1
-        // "quota window surfaces as latency" semantics), bounded by the
-        // amendment: total hold <= ZAI_QUOTA_WAIT_MAX_MS and total attempts
-        // <= ZAI_MAX_RETRY_ATTEMPTS, else the error surfaces.
-        const hold = holds.get(event.sessionID) ?? { heldMs: 0 }
-        const wait = Math.min(state.pendingHoldMs || QUOTA_WAIT_POLL_MS, QUOTA_WAIT_MAX_MS - hold.heldMs)
-        if (wait <= 0) {
-          event.decision = { retry: false }
-          holds.delete(event.sessionID)
-          logLine({ event: "quota_wait_cap_reached", heldMs: hold.heldMs, capMs: QUOTA_WAIT_MAX_MS })
+        if (status === 401 || status === 403) {
+          const next = nextUsable(state.active)
+          if (next === -1) {
+            const earliest = earliestCoolingExpiry()
+            if (Number.isFinite(earliest)) {
+              // Amendment 4: some keys are merely cooling down (429), none is
+              // hard-disabled - never answer retry:false while any key is
+              // only rate-limited. Force the retry; http.request holds until
+              // a key is usable and issues authenticated, so the cooldown
+              // surfaces as latency (V1 semantics).
+              event.decision = { retry: true, delay: 0 }
+              logLine({
+                event: "all_keys_cooling_retry",
+                status,
+                nextUsableAt: new Date(earliest).toISOString(),
+              })
+              return
+            }
+            event.decision = { retry: false }
+            logLine({ event: "all_keys_rejected", status })
+            return
+          }
+          state.active = next
+          event.decision = { retry: true, delay: 0 }
+          logLine({
+            event: "rotation",
+            from: event.attempt,
+            to: maskKey(state.accounts[next].apiKey),
+            reason: `status ${status}`,
+          })
           return
         }
-        logLine({ event: "quota_hold_retry", waitMs: wait, heldMs: hold.heldMs, capMs: QUOTA_WAIT_MAX_MS })
-        await sleep(wait) // hold-and-resume: the quota window surfaces as latency
-        hold.heldMs += wait
-        holds.set(event.sessionID, hold)
-        event.decision = { retry: true, delay: 0 }
+
+        if (status === 429 && QUOTA_WAIT_ENABLED) {
+          // Quota hold-and-resume: hold inside this hook invocation (the
+          // faithful shape per the spike - the host's built-in attempt budget
+          // is a hard limit, so holding in one logical retry preserves the v1
+          // "quota window surfaces as latency" semantics), bounded by the
+          // amendment: total hold <= ZAI_QUOTA_WAIT_MAX_MS and total attempts
+          // <= ZAI_MAX_RETRY_ATTEMPTS, else the error surfaces.
+          //
+          // Amendment 11: the hold only runs for a stashed
+          // subscription-endpoint 429 (the /coding/ gate is applied when the
+          // response stashes). No stash for this session (non-coding URL, or
+          // no 429 response seen) means no forced retry - the host default
+          // applies, matching the V1 half under any configuration.
+          const hold = holds.get(event.sessionID)
+          if (hold === undefined || !Number.isFinite(hold.holdMs)) {
+            logLine({ event: "quota_429_no_hold", sessionID: event.sessionID, status })
+            return
+          }
+          const wait = Math.min(hold.holdMs, QUOTA_WAIT_MAX_MS - hold.heldMs)
+          if (wait <= 0) {
+            event.decision = { retry: false }
+            holds.delete(event.sessionID)
+            logLine({ event: "quota_wait_cap_reached", heldMs: hold.heldMs, capMs: QUOTA_WAIT_MAX_MS })
+            return
+          }
+          logLine({ event: "quota_hold_retry", waitMs: wait, heldMs: hold.heldMs, capMs: QUOTA_WAIT_MAX_MS })
+          await sleep(wait) // hold-and-resume: the quota window surfaces as latency
+          hold.heldMs += wait
+          holds.set(event.sessionID, hold)
+          event.decision = { retry: true, delay: 0 }
+        }
+      } catch (err) {
+        logLine({ event: "hook_non_essential_failure", hook: "retry", error: errText(err) })
       }
     }, { providerID: PROVIDER_ID })
 
