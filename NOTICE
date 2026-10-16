@@ -1,0 +1,16 @@
+opencode-zai-multi-account
+Copyright 2026 Matthew Dresden
+
+This product is original work, extracted from the author's private
+configuration repository (matthew-dresden/opencode-config) at commit
+1857c39b7c7bd5ca38ff976b6df18ab54784dd40 (branch v2-migration) and ported
+to the opencode v2 plugin API.
+
+The files src/zai-quota.js, src/request-body.js, and src/model-profiles.js
+are verbatim ports of lib/zai-quota.js, lib/request-body.js, and
+lib/model-profiles.js from that repository, Copyright 2026 Matthew Dresden,
+licensed under the same Apache License 2.0.
+
+No third-party code is included.
+
+Contact: open an issue in this repository.
