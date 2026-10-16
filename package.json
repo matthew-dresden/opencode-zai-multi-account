@@ -1,6 +1,6 @@
 {
   "name": "@matthew-dresden/opencode-zai-multi-account",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "opencode v2 plugin: Z.AI coding-plan key-pool auth, rotation, and quota hold-and-resume",
   "type": "module",
   "main": "index.js",
