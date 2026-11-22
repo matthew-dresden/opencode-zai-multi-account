@@ -1,7 +1,7 @@
 {
   "name": "@matthew-dresden/opencode-zai-multi-account",
-  "version": "1.0.0",
-  "description": "opencode v2 plugin: Z.AI coding-plan key-pool auth, rotation, and quota hold-and-resume",
+  "version": "2.0.0",
+  "description": "opencode v2 plugin: multi-provider Z.AI coding-plan key pools (zai-max-*) with rotation, cooldown, and quota hold-and-resume",
   "type": "module",
   "main": "index.js",
   "license": "Apache-2.0",
@@ -15,8 +15,10 @@
     "registry": "https://npm.pkg.github.com/"
   },
   "scripts": {
-    "test": "node --test tests/zai-quota.test.mjs tests/plugin.test.mjs tests/env-overrides.test.mjs tests/v1-server.test.mjs",
-    "check:tarball": "node scripts/check-tarball.mjs"
+    "test": "node --test tests/zai-quota.test.mjs tests/unit-pool.test.mjs tests/unit-rotation.test.mjs tests/unit-body.test.mjs tests/plugin.test.mjs tests/regression.test.mjs",
+    "lint": "node --check index.js && node --check src/config.js && node --check src/log.js && node --check src/pool.js && node --check src/rotation.js && node --check src/holds.js && node --check src/request-body.js && node --check src/model-profiles.js && node --check src/zai-quota.js && node --check scripts/check-license.mjs && node --check scripts/check-tarball.mjs",
+    "check:tarball": "node scripts/check-tarball.mjs",
+    "check:license": "node scripts/check-license.mjs"
   },
   "engines": {
     "node": ">=20"
