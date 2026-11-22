@@ -114,22 +114,35 @@ test("loadPool loudly warns when pool perms are looser than 0600, and stays quie
 
 test("loadPool short-circuits on unchanged mtime and re-reads when mtime moves", () => {
   const id = "zai-max-pool-mtime"
-  // Pin a known integer-ms mtime BEFORE the first load so the pinned value
-  // survives Date's millisecond precision round-trip.
-  const T = Date.now() - 10000
+  // Same-Date mtime pinning: an identical Date input stores identical
+  // nanoseconds on every platform, so statSync returns the identical value
+  // both times (stat-to-stat equality is what the plugin's short-circuit
+  // compares). Assertions are behavioral: content and logs, never raw
+  // mtime floats (Linux ns storage makes Date round-trips float-inexact).
+  const T = Date.now() + 60000
   writePool(id, [{ label: "one", apiKey: "mtime-key-000001" }])
   utimesSync(poolPath(id), new Date(T), new Date(T))
   const pool = loadPool(id)
   assert.equal(pool.accounts.length, 1)
-  assert.equal(pool.mtimeMs, T)
+  assert.equal(pool.accounts[0].apiKey, "mtime-key-000001")
   const announceCount = readLog().filter((l) => l.event === "plugin_loaded" && l.providerID === id).length
 
-  // Rewrite the file but pin the mtime back to T: the read path must NOT
-  // re-parse.
+  // Swap the content while restoring the exact same mtime: the read path
+  // must NOT re-parse (the cache still holds the old key).
   writeFileSync(poolPath(id), JSON.stringify({ accounts: [{ label: "two", apiKey: "mtime-key-000002" }] }))
   utimesSync(poolPath(id), new Date(T), new Date(T))
   loadPool(id)
   assert.equal(pool.accounts.length, 1, "unchanged mtime must short-circuit the re-read")
+  assert.equal(pool.accounts[0].apiKey, "mtime-key-000001", "the cached key must be the pre-change one")
+  assert.equal(
+    readLog().filter((l) => l.event === "pool_reloaded" && l.providerID === id).length,
+    0,
+    "no pool_reloaded may be logged when the mtime is unchanged",
+  )
+  assert.ok(
+    readLog().filter((l) => l.event === "plugin_loaded" && l.providerID === id).length === announceCount,
+    "no re-announce on short-circuit",
+  )
 
   // Move the mtime forward: the read path re-parses and logs pool_reloaded.
   utimesSync(poolPath(id), new Date(T + 5000), new Date(T + 5000))
