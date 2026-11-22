@@ -4,6 +4,16 @@
 
 ### Breaking Changes
 
+- serve all zai-max-* providers with native v2 hooks and isolated key pools (#3)
+
+### Added
+
+- serve all zai-max-* providers with native v2 hooks and isolated key pools (#3)
+
+## [2.0.0] - 2026-11-22
+
+### Breaking Changes
+
 - feat!: serve every `zai-max-*` provider with isolated per-provider key pools, rotation, cooldown, and quota hold-and-resume
 - feat!: remove the v1 `auth: { provider, loader }` export and the `server()` compat shape; the plugin is now a native v2 `{ id, setup }` plugin and never falls back to stored auth - an unusable pool fails fast
 - feat!: rename `ZAI_ACCOUNTS_PATH` to `ZAI_ACCOUNTS_DIR` (per-provider pool files `zai-accounts-<providerID>.json`) and `ZAI_QUOTA_WAIT_POLL_MS` to `ZAI_QUOTA_POLL_MS`
