@@ -4,10 +4,11 @@
 // Packs the package (npm pack), then asserts the tarball matches the
 // package.json "files" allowlist policy and contains no secret material:
 //   ALLOWLIST (exact set): package.json, README.md, LICENSE, NOTICE,
-//   index.js, src/zai-quota.js, src/request-body.js, src/model-profiles.js.
+//   index.js, and the eight src/ modules (config, log, pool, rotation,
+//   holds, zai-quota, request-body, model-profiles).
 //   npm adds the mandatory metadata files automatically; index.js + the
-//   three src/ helper ports are the only shipped sources. Any member outside
-//   the allowlist is a violation. The key pool file NEVER ships: it lives
+//   src/ modules are the only shipped sources. Any member outside the
+//   allowlist is a violation. The key pool file NEVER ships: it lives
 //   outside every repository and is read from disk at runtime only.
 //   FORBIDDEN content: private key blocks, cloud API token shapes, and
 //   key=value secret assignments in text files.
@@ -26,6 +27,11 @@ const ALLOWLIST = new Set([
   "LICENSE",
   "NOTICE",
   "index.js",
+  "src/config.js",
+  "src/log.js",
+  "src/pool.js",
+  "src/rotation.js",
+  "src/holds.js",
   "src/zai-quota.js",
   "src/request-body.js",
   "src/model-profiles.js",
