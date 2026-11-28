@@ -18,7 +18,8 @@
     "test": "node --test tests/zai-quota.test.mjs tests/unit-pool.test.mjs tests/unit-rotation.test.mjs tests/unit-body.test.mjs tests/plugin.test.mjs tests/regression.test.mjs",
     "lint": "node --check index.js && node --check src/config.js && node --check src/log.js && node --check src/pool.js && node --check src/rotation.js && node --check src/holds.js && node --check src/request-body.js && node --check src/model-profiles.js && node --check src/zai-quota.js && node --check scripts/check-license.mjs && node --check scripts/check-tarball.mjs",
     "check:tarball": "node scripts/check-tarball.mjs",
-    "check:license": "node scripts/check-license.mjs"
+    "check:license": "node scripts/check-license.mjs",
+    "prepare": "bash scripts/security/install-hooks.sh"
   },
   "engines": {
     "node": ">=20"
