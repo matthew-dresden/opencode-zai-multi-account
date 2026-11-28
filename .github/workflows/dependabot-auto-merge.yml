@@ -1,0 +1,46 @@
+name: Dependabot Auto-merge
+
+# The Dependabot plane: Dependabot pull requests run with a read-only
+# GITHUB_TOKEN on the pull_request trigger, so their enablement rides
+# pull_request_target with the repository's own full token. Pwn requests are
+# out of scope by construction: this workflow performs no checkout and only
+# calls the gh API. The author gate keeps every non-Dependabot pull request
+# out; automerge.yml remains the human plane (one implementation per plane).
+# Draft refusal stays. Every merge command carries --auto (squash); a bare
+# merge could fire on a red pull request and is forbidden.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot-auto-merge:
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check auto-merge state
+        id: state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          enabled="$(gh pr view '${{ github.event.pull_request.number }}'
+          --repo '${{ github.repository }}' --json autoMergeRequest
+          --jq '.autoMergeRequest != null')";
+          echo "already_enabled=${enabled}" >> "${GITHUB_OUTPUT}"
+
+      - name: Enable auto-merge (squash)
+        if: steps.state.outputs.already_enabled == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          gh pr merge --auto --squash --delete-branch
+          --repo '${{ github.repository }}'
+          '${{ github.event.pull_request.number }}'
